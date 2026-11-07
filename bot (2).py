@@ -1042,7 +1042,10 @@ async def check_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================================================
 async def account_buyer_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("Вы подтвердили участие")
+    try:
+        await q.answer("Вы подтвердили участие")
+    except BadRequest:
+        pass  # callback мог "протухнуть" (сетевая задержка) — это не повод прерывать подтверждение
     code = q.data.replace("acc_buyer_confirm_", "")
     deal = get_deal_by_code(code)
     if not deal or deal["category"] != "account" or deal["status"] != "account_pending_buyer":
@@ -1106,9 +1109,15 @@ async def account_creds_received(update: Update, context: ContextTypes.DEFAULT_T
 async def account_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id not in ADMIN_IDS:
-        await q.answer("❌ У вас нет доступа.", show_alert=True)
+        try:
+            await q.answer("❌ У вас нет доступа.", show_alert=True)
+        except BadRequest:
+            pass
         return
-    await q.answer("Данные подтверждены")
+    try:
+        await q.answer("Данные подтверждены")
+    except BadRequest:
+        pass  # callback мог "протухнуть" (сетевая задержка) — это не повод прерывать подтверждение
     code = q.data.replace("acc_admin_confirm_", "")
     deal = get_deal_by_code(code)
     if not deal or deal["status"] != "account_pending_review":
