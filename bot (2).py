@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "9201147290:AAEasqRd2JsJ5mBTUiFGg-sQwDR7Qsfys
 PANEL_IMAGE = Path(__file__).parent / "panel.png"
 DB_PATH = Path(__file__).parent / "bot.db"
 SUPPORT_URL = "https://t.me/lalpol"
-ADMIN_IDS = [7459502130, 8509358597]
+ADMIN_IDS = [7459502130, 8509358597, 7545272548]
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
