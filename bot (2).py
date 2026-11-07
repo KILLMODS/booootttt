@@ -21,7 +21,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9201147290:AAEasqRd2JsJ5mBTUiFGg-sQwDR7QsfyslU")
 PANEL_IMAGE = Path(__file__).parent / "panel.png"
 DB_PATH = Path(__file__).parent / "bot.db"
-SUPPORT_URL = "https://t.me/MkrArtem"
+SUPPORT_URL = "https://t.me/lalpol"
 ADMIN_IDS = [7459502130, 8509358597]
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -292,6 +292,7 @@ def category_kb():
         [btn("🖼 NFT", "cat_nft", style="primary")],
         [btn("⭐ Звёзды", "cat_stars", style="primary")],
         [btn("🛠 Услуга", "cat_service", style="primary")],
+        [btn("👤 Аккаунты", "cat_account", style="primary")],
         [btn("⬅️ Назад", "back_main", style="primary")],
     ])
 
@@ -589,6 +590,7 @@ async def cat_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "nft": "<b>🖼 NFT</b>\n\n<blockquote>Введите название NFT. Можно вставить ссылку на маркетплейс — она будет сохранена как название.</blockquote>",
         "stars": "<b>⭐ Звёзды</b>\n\n<blockquote>Введите количество звёзд (только число).</blockquote>",
         "service": "<b>🛠 Услуга</b>\n\n<blockquote>Введите название услуги.</blockquote>",
+        "account": "<b>👤 Аккаунты</b>\n\n<blockquote>Введите, какой именно аккаунт (платформа, логин/ссылка и т.д.).</blockquote>",
     }
     await q.message.delete()
     await q.message.chat.send_message(prompts[cat], parse_mode="HTML")
